@@ -46,7 +46,7 @@ import tempfile
 
 # Values that mean "absent" but are not NULL. Compared after trimming, ignoring case.
 # Add your own with --sentinel. "0" is not here: it is a real value in many numeric columns.
-DEFAULT_SENTINELS = ("not found", "n/a", "na", "none", "null", "<null>", "nan",
+DEFAULT_SENTINELS = ("not found", "n/a", "#n/a", "na", "none", "null", "<null>", "nan",
                      "unknown", "tbd", "-", "-9999", "-999")
 
 # Largest share of present-looking joined values that may be sentinels before the run refuses.
@@ -114,9 +114,26 @@ def status_of(key, lookup, sentinels):
     value = next(iter(values))
     if value == "":
         return "blank-value"
-    if value.lower() in sentinels:
+    if value.lower() in sentinels or _canonical_number(value) in sentinels:
         return "sentinel"
     return "ok"
+
+
+def _canonical_number(value):
+    """Spell a whole number written with a decimal point (-9999.0, -999.00) without it.
+
+    pandas and Excel write float columns that way. Text without a dot is returned unchanged,
+    lower case, so 007 stays 007. Anything that is not a finite whole number is returned
+    unchanged too.
+    """
+    low = value.lower()
+    if "." not in low:
+        return low
+    try:
+        number = float(low)
+    except ValueError:
+        return low
+    return str(int(number)) if number.is_integer() else low
 
 
 def analyse(lheader, lrows, rheader, rrows, key, rkey, value,
@@ -134,7 +151,8 @@ def analyse(lheader, lrows, rheader, rrows, key, rkey, value,
     lookup = {}
     lookup_n = {}
     for row in rrows:
-        # A blank key is stored but never read: status_of tests for a blank left key first.
+        # A blank key is stored, and counted in lookup_n, but never read: a blank left key
+        # never matches and never fans out (see the fan-out line below).
         rk = row[rki].strip()
         lookup.setdefault(rk, set()).add(row[rvi].strip())
         lookup_n[rk] = lookup_n.get(rk, 0) + 1
@@ -162,8 +180,9 @@ def analyse(lheader, lrows, rheader, rrows, key, rkey, value,
         if lk in repeated:
             reasons.append("repeated-key")
         # A key listed on n lookup rows turns one left row into n in a real join. An ambiguous
-        # key (different values) is counted as ambiguous, not here.
-        fan = 0 if status == "ambiguous" else lookup_n.get(lk, 1) - 1
+        # key (different values) is counted as ambiguous, not here. A blank key matches
+        # nothing, so it cannot fan out even when the lookup has several blank-key rows.
+        fan = 0 if status in ("ambiguous", "blank-key") else lookup_n.get(lk, 1) - 1
         if fan:
             fanout_rows += 1
             fanout_extra += fan
@@ -289,7 +308,10 @@ def read_table(path):
     rows = []
     for n, row in enumerate(raw[1:], 1):
         if not row:
-            continue  # a blank line, usually trailing
+            if len(header) == 1:
+                row = [""]  # in a one-column file an empty line is a blank cell, not nothing
+            else:
+                continue  # a blank line, usually trailing
         if len(row) != len(header):
             raise ValueError("%s: data row %d has %d cell(s), the header has %d"
                              % (path, n, len(row), len(header)))
@@ -661,6 +683,17 @@ def self_test():
     check(rep10c["fanout_rows"] == 0 and decide(rep10c).verdict == PASS,
           "a repeated lookup key that no left row uses does not refuse (see Limits)")
 
+    # ---- a blank key matches nothing, so it cannot fan out, however many blank lookup rows exist
+    rep10d = analyse(LEFT_HEADER, [["A", "N", "a"], ["", "N", "b"]], RIGHT_HEADER,
+                     [["A", "Oak"], ["", "x"], ["", "y"]], "PARCEL", "PARCEL", "SUBDIV")
+    check(rep10d["fanout_rows"] == 0 and rep10d["fanout_extra"] == 0
+          and decide(rep10d).verdict == PASS and rep10d["flagged"] == [(1, ["blank-key"])],
+          "two blank lookup keys do not fan a blank left key out  <-- pinned defect")
+    rep10e = analyse(LEFT_HEADER, [["A", "N", "a"], ["  ", "N", "b"]], RIGHT_HEADER,
+                     [["A", "Oak"], [" ", "x"], ["", "y"]], "PARCEL", "PARCEL", "SUBDIV")
+    check(rep10e["fanout_rows"] == 0 and rep10e["by_status"]["blank-key"] == 1,
+          "a whitespace-only key is blank on both sides and does not fan out  <-- pinned defect")
+
     # ---- keys, sentinels and class values are trimmed before they are compared
     rep11 = analyse(LEFT_HEADER, [[" K ", "N", "a"], ["K", "N", "b"]], RIGHT_HEADER,
                     [[" K", "Oak"]], "PARCEL", "PARCEL", "SUBDIV")
@@ -692,9 +725,34 @@ def self_test():
                      "PARCEL", "SUBDIV")
     check(decide(sent18).verdict == REFUSE, "and one sentinel in 19 values refuses")
 
+    # ---- spellings of a placeholder that Excel and pandas write  <-- pinned defect
+    for spelling in ("#N/A", "#n/a", "-9999.0", "-9999.00", "-999.0", "-999.00"):
+        check(status_of("A", {"A": {spelling}}, sent) == "sentinel",
+              "%s is a default placeholder  <-- pinned defect" % spelling)
+    for real in ("-9999.5", "0.0", "007", "v1.2", "1.2.3", "9999.0"):
+        check(status_of("A", {"A": {real}}, sent) == "ok", "%s is a real value" % real)
+    check(status_of("A", {"A": {"0.0"}}, frozenset(["0"])) == "sentinel",
+          "a custom sentinel 0 also catches 0.0")
+
+    # ---- the default --max-absent is 0.5: a join that lost 55 percent must not exit 0
+    lost55 = [["P%d" % i, "N", "o"] for i in range(1, 101)]
+    rep12 = analyse(LEFT_HEADER, lost55, RIGHT_HEADER, [["P%d" % i, "Oak"] for i in range(1, 46)],
+                    "PARCEL", "PARCEL", "SUBDIV")
+    check(DEFAULT_MAX_ABSENT == 0.5 and decide(rep12).verdict == REFUSE
+          and "--max-absent" in decide(rep12).reasons[0],
+          "55 of 100 rows lost refuses under the default --max-absent  <-- pinned defect")
+    rep12b = analyse(LEFT_HEADER, lost55, RIGHT_HEADER,
+                     [["P%d" % i, "Oak"] for i in range(1, 51)], "PARCEL", "PARCEL", "SUBDIV")
+    check(decide(rep12b).verdict == PASS, "and exactly 50 of 100 lost passes the default")
+
     # ---- missing columns
     raises(lambda: analyse(LEFT_HEADER, [], RIGHT_HEADER, [], "NOPE", "PARCEL", "SUBDIV"),
            "a missing left key column raises")
+    try:
+        analyse(LEFT_HEADER, [], RIGHT_HEADER, [], "NOPE", "PARCEL", "SUBDIV")
+    except ValueError as exc:
+        check(str(exc).startswith("left table has no column 'NOPE'"),
+              "the missing left column error names the left table")
     raises(lambda: analyse(LEFT_HEADER, [], RIGHT_HEADER, [], "PARCEL", "PARCEL", "NOPE"),
            "a missing lookup value column raises")
     raises(lambda: analyse(LEFT_HEADER, [], RIGHT_HEADER, [], "PARCEL", "PARCEL", "SUBDIV",
@@ -705,6 +763,8 @@ def self_test():
     check(lines[-1] == "VERDICT: REFUSE", "a refused report ends with its verdict")
     check(any(l.startswith("  REFUSED:") for l in lines), "a refusal reason is labelled REFUSED")
     check(any(l.startswith("class FLAG") for l in lines), "the class line names the column")
+    check("outside the class:  8 row(s): 2 absent" in lines,
+          "the report counts the rows outside the class")
     check(any(l.startswith("repeated lookup:") for l in describe(rep10, dec10)),
           "the report has a repeated lookup line")
     lines6 = describe(rep6, dec6)
@@ -784,6 +844,13 @@ def _files(h, scratch):
            "a row with too many cells raises instead of shifting columns  <-- pinned defect")
     _put(p("quote.csv"), 'A,B\n"open,2\n')
     raises(lambda: read_table(p("quote.csv")), "an unterminated quote raises")
+    _put(p("midquote.csv"), 'A,B\n"Oak"Grove,2\n')
+    raises(lambda: read_table(p("midquote.csv")),
+           "text after a closing quote raises (strict quoting)  <-- pinned defect")
+    _put(p("onecol.csv"), "PARCEL\nP01\n\n\n\n\n\n\nP02\n")
+    check(read_table(p("onecol.csv"))[1] == [["P01"]] + [[""]] * 6 + [["P02"]],
+          "in a one-column file an empty line is a blank cell, not a skipped row"
+          "  <-- pinned defect")
     with io.open(p("latin.csv"), "wb") as fh:
         fh.write(b"A,B\n\xff,2\n")
     raises(lambda: read_table(p("latin.csv")), "bytes that are not UTF-8 raise")
@@ -800,7 +867,8 @@ def _files(h, scratch):
     check("2 of 2 class row(s) came back absent" in out, "the class loss is printed")
     check(sorted(os.listdir(scratch)) == sorted(["left.csv", "right.csv", "bom.csv", "empty.csv",
                                                  "dup.csv", "ragged.csv", "quote.csv",
-                                                 "latin.csv", "spaced.csv"]),
+                                                 "latin.csv", "spaced.csv", "midquote.csv",
+                                                 "onecol.csv"]),
           "a check run wrote no file  <-- pinned defect")
     code, out, err = _run(base + ["--allow-repeats", "1", "--max-sentinel", "1.0"])
     check(code == 0 and "VERDICT: PASS" in out,
@@ -873,6 +941,23 @@ def _files(h, scratch):
                            "--value", "SUBDIV"])
     check(code == 1 and "1 left row(s) hit a repeated lookup key, 1 extra row(s)" in out,
           "a lookup key listed twice exits 1 through main  <-- pinned defect")
+
+    _put(p("one_r.csv"), "PARCEL,SUBDIV\nP01,Oak\nP02,Oak\n,x\n,y\n")
+    _put(p("one_l.csv"), "PARCEL\nP01\n\n\n\n\n\n\nP02\n")
+    code, out, err = _run(["--left", p("one_l.csv"), "--right", p("one_r.csv"), "--key",
+                           "PARCEL", "--value", "SUBDIV"])
+    check(code == 1 and "6 blank key" in out and "6 of 8 left row(s)" in out,
+          "six blank keys in a one-column left file are counted and refused  <-- pinned defect")
+    _put(p("bk_l.csv"), "PARCEL,FLAG\nP01,N\n,N\nP02,N\n")
+    code, out, err = _run(["--left", p("bk_l.csv"), "--right", p("one_r.csv"), "--key", "PARCEL",
+                           "--value", "SUBDIV"])
+    check(code == 0 and "0 left row(s) hit a repeated lookup key" in out,
+          "a lookup with two blank-key rows does not refuse a clean join  <-- pinned defect")
+    _put(p("na_r.csv"), "PARCEL,SUBDIV\nP01,#N/A\nP02,-9999.0\n")
+    code, out, err = _run(["--left", p("bk_l.csv"), "--right", p("na_r.csv"), "--key", "PARCEL",
+                           "--value", "SUBDIV"])
+    check(code == 1 and "2 sentinel" in out,
+          "a column of #N/A and -9999.0 is refused through main  <-- pinned defect")
 
     # ---- the parser: nothing abbreviates
     a = _parse(base)

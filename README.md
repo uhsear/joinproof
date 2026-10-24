@@ -38,8 +38,20 @@ VERDICT: REFUSE
 Check only. 6 flagged row(s) would go to flagged.csv; re-run with --apply.
 ```
 
-The data above is synthetic. It is ten invented rows (`P01` to `P09`, with `P09` twice) and a
-lookup with eight rows, one of which has a blank key.
+The data above is synthetic. These are the exact rows, and the self-test builds the same files.
+
+```
+left.csv                      lookup.csv
+PARCEL,FLAG,OWNER             PARCEL,SUBDIV
+P01,N,a   P06,N,f             P01,Oak
+P02,N,b   P07,N,g             P02,Oak
+P03,Y,c   P08,N,h             P05,Elm
+P04,S,d   P09,N,i             P06,Not Found
+P05,N,e   P09,N,j             P07,"  "
+                              P08,Elm
+                              P09,Elm
+                              ,Orphan
+```
 
 ## What already exists
 
@@ -52,8 +64,10 @@ lookup with eight rows, one of which has a blank key.
 - **Great Expectations** is a general data-validation framework. It suits a team that keeps a
   suite of expectations over many tables, which this one-file tool does not try to be. It was
   not run for this README, so nothing here says whether it can express these checks.
-- **ArcGIS Pro Add Join** keeps every input row by default and gives unmatched rows NULL in the
-  joined fields. With a join table that has no Object ID field, only a one-to-first join is possible. See the references.
+- **ArcGIS Pro Add Join** keeps every input row by default (`KEEP_ALL`) and gives unmatched
+  rows NULL in the joined fields. When the join table has no Object ID field, Esri says only a
+  one-to-first join is possible, so repeated lookup keys are hidden there instead of fanning
+  out. It reports neither case. See the references.
 
 A search of GitHub for the name `joinproof` on 2026-10-23 found this repository and one other,
 `dvygolov/TG.JoinProof`. That one concerns Telegram and is unrelated. A second search, for join
@@ -91,14 +105,14 @@ PASS  a key written two ways joins nothing and exits 4, not 0  <-- pinned defect
 PASS  a prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
 ...
 --------------------------------------------------------------------
-126 assertions, 0 failed
+150 assertions, 0 failed
 ```
 
-The self-test prints 126 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu
-(Python 3.12.3). The Windows and Ubuntu outputs match line for line, apart from the line endings
-(CRLF on Windows). `coverage run --branch joinproof.py --self-test` reports 100 percent of lines
-and branches (532 statements, 102 branches). The code passes `pyflakes` and compiles under
-`python -W error`.
+The self-test prints 150 assertions on Windows (Python 3.13.2 and 3.12), on Ubuntu (Python
+3.12.3) and on Linux Python 3.9.25. The Windows 3.13 and Ubuntu 3.12 outputs match line for line
+(compared with `diff`, after the CRLF line endings are removed). `coverage run --branch
+joinproof.py --self-test` reports 100 percent of lines and branches (576 statements, 110
+branches). The code passes `pyflakes` and compiles under `python -W error`.
 
 ## Usage
 
@@ -139,14 +153,17 @@ The tool joins the two tables in memory. Each left row gets one status.
 |---|---|
 | `ok` | The key matched, and the value is real. |
 | `no-match` | The key is not in the lookup. A left join returns NULL here. |
-| `blank-key` | The left key is empty. A NULL key never matches, not even another NULL. |
+| `blank-key` | The left key is empty. A NULL key never matches, not even another NULL, so it never counts as a repeated lookup key either. |
 | `blank-value` | The key matched, and the value is empty. |
 | `sentinel` | The key matched, and the value is a placeholder. |
 | `ambiguous` | The lookup holds more than one distinct value for the key. |
 
-The default placeholders are `Not Found`, `N/A`, `NA`, `None`, `Null`, `<Null>`, `NaN`, `Unknown`, `TBD`,
-`-`, `-9999` and `-999`. The tool trims the value and ignores case. `0` is not on the list because
-it is a real value in many numeric columns. Add it with `--sentinel 0` when it is not.
+The default placeholders are `Not Found`, `N/A`, `#N/A`, `NA`, `None`, `Null`, `<Null>`, `NaN`,
+`Unknown`, `TBD`, `-`, `-9999` and `-999`. The tool trims the value and ignores case. A whole
+number written with a decimal point (`-9999.0`, `-999.00`) counts as the same placeholder as
+the number without it, because pandas and Excel write float columns that way. `0` is not on the
+list because it is a real value in many numeric columns. Add it with `--sentinel 0` when it is
+not. The list cannot be switched off: see Limits.
 
 The run is refused when any of these is true. The tool also reports each lookup-side repeat.
 
@@ -159,16 +176,17 @@ The run is refused when any of these is true. The tool also reports each lookup-
    refused, because 0 of 0 would otherwise pass.
 4. **Too many sentinels.** The sentinels exceed `--max-sentinel` of the values that look present.
 5. **Repeated lookup keys.** A left row hits a lookup key that is listed on more than one lookup
-   row, even when every row holds the same value. A SQL, pandas or Add Join left join then
-   returns extra rows. The report counts the left rows and the extra rows.
+   row, even when every row holds the same value. A SQL or pandas left join then returns extra
+   rows, and so does an Add Join when the lookup has an Object ID field. The report counts the
+   left rows and the extra rows. A blank key is never counted here.
 6. **Too many absent rows.** More than `--max-absent` of all left rows have no usable joined
    value. With a default of one half, a join where 99 of 100 keys found no partner is refused
    with or without a class. Lower the limit for a tighter net.
 
-The run exits 4 and says so when no left row matched any lookup key. Note that a half-broken key
-format, such as `12` against `12.0` on most rows, is caught by check 6 and not by exit 4. That is a check that
-compared nothing. A key written two ways (`H-001` and `H-1`, or `12` and `12.0`) causes it.
-A scheduled job must not read that clean exit as "safe to publish".
+The run exits 4 and says so when no left row matched any lookup key. A key written two ways
+(`H-001` and `H-1`, or `12` and `12.0`) causes it. A half-broken key format, such as `12`
+against `12.0` on most rows, is not exit 4. Check 6 catches it when enough rows are lost. A
+scheduled job must not read a clean exit as "safe to publish".
 
 ## What it writes
 
@@ -185,40 +203,67 @@ else writes.
 - Keys are compared as trimmed text, case sensitive. `001` and `1` are different keys, and so
   are `12` and `12.0`. Such a mismatch stops the run with exit 4 only when no row at all matches.
   Otherwise the `--max-absent` check catches it when enough rows are lost.
-- Values are compared as text, so the `-9999` default does not match `-9999.0`.
+- Values are compared as text. Only a whole number written with a decimal point is read as its
+  plain spelling, so `-9999.5` is a real value and `007` is not `7`.
 - Keys are case sensitive, but class values and sentinels are not. Unicode normalisation (NFC
   against NFD) and zero-width characters are not handled, and a class value that contains a
   comma cannot be given.
 - The join is single column. A composite key must be concatenated first.
 - The tool checks one `--value` column per run.
 - The sentinel list is a list of common placeholders. It cannot know yours. Add them with
-  `--sentinel`. It does not include Excel's `#N/A`, nor numeric spellings such as `-9999.0` or
-  `-999.00` (what pandas writes for float columns). A column made only of those values passes
-  as `ok` (verified). Sentinels are checked only in the `--value` column, not in the key or the
-  class column.
+  `--sentinel`. Sentinels are checked only in the `--value` column, not in the key or the class
+  column. A placeholder with an inner double space, such as `Not  Found`, is not recognised and
+  passes as a real value (verified, exit 0).
+- The default placeholders cannot be removed. `NA`, `None` and `Unknown` can be real codes, and
+  a lookup that uses them as real data is over-counted: a column of `NA` values exits 1
+  (verified).
+- Placeholders at or below `--max-sentinel` (5 percent by default) are reported and pass with
+  exit 0 when there is no `--class-col`.
 - A `--sentinel` value that begins with `-` is read by argparse as a flag and exits 2. Write it
-  as `--sentinel=-x`.
-- Blank lines are skipped. A one-column left file therefore loses its blank-key rows, and they
-  are not counted as blank-key. A blank key never causes a refusal anyway.
+  as `--sentinel=-x`. A `--class-values` item that begins with a hyphen is accepted only when it
+  looks like a negative number, such as `-1`. Another hyphen-led value, such as `-x`, exits 2
+  and must be written `--class-values=-x`.
+- Blank lines are skipped, except in a one-column file. There an empty line is a blank cell, so
+  it counts as a `blank-key` row (a trailing empty line counts too). Blank keys count toward
+  `--max-absent`, so a one-column left file that is mostly blank lines is refused (verified: 6 of
+  8, exit 1).
+- A whitespace-only line is not blank. It has one cell, so a file with a trailing line of spaces
+  exits 64 (`data row N has 1 cell(s)`). A file that begins with an empty line exits 64 with
+  `data row 1 has 2 cell(s), the header has 0`. A ragged row, or trailing commas from some
+  exporters, stops the run with exit 64 for the whole file. Fix the export first.
+- Only comma-delimited CSV is read. A semicolon or tab file is read as one column and exits 64
+  with `no column` (verified). A field longer than 131072 characters exits 64 (the Python `csv`
+  field limit). A quote followed by text inside a cell, such as `"Oak"Grove`, exits 64 (strict
+  quoting).
+- A column that is blank on up to half of the matched rows, with no `--class-col`, passes. Blank
+  values are not sentinels and count only toward `--max-absent` (verified: 2 blank of 5 rows
+  exits 0).
+- A NUL byte in a CSV raises `csv.Error` (exit 64) on Python 3.9 and 3.10 and is read as data on
+  3.11 and later. I saw it read as data on 3.13. Python 3.10 and 3.11 were not run.
 - A lookup key that has two values is counted as ambiguous, and one that is listed twice with the
   same value is counted as a repeat. Both are counted only for lookup keys that some left row uses.
 - Everything is held in memory. The run time and memory on a very large table were not measured.
 - With stdout redirected on Windows (cp1252), a non-ASCII column name that gets printed (for
   example `--class-col` with CJK text) raises `UnicodeEncodeError` after the first report lines.
-  The traceback ends in exit 1, the same code as a refusal. Set `PYTHONUTF8=1` or use ASCII
-  headers (verified).
+  The traceback ends in exit 1, the same code as a refusal, so a scheduler cannot tell a crash
+  from a finding. Set `PYTHONUTF8=1` or use ASCII headers (verified). An `--out` path that cp1252
+  cannot encode does the same in the `Wrote` or `Check only` line, and with `--apply` the file
+  is already written when it happens (verified with a CJK file name).
 - `--out` copies the flagged left rows unchanged. A cell that starts with `=`, `+`, `-` or `@`
   can run as a formula when a spreadsheet opens the file. The file also holds your left data
   (for example owner names) in a new, unprotected CSV. Handle it as sensitive.
 - The write is exclusive. Case variants, absolute or relative spellings, a trailing dot and a
-  `::$DATA` suffix of an existing file all exit 3 (verified). Windows device names such as `NUL`
-  and hard links to a new name were not tested.
+  `::$DATA` suffix of an existing file all exit 3 (verified). A Windows device name is not
+  rejected: `--out NUL --apply` prints `Wrote 1 flagged row(s) to NUL.` and stores nothing
+  (verified). Hard links to a new name were not tested.
 - If a disk error happens part way through an `--apply` write, a partial `--out` file is left
   behind and the exit is 3. Exit 3 also hides the check verdict from the exit code, although
   the verdict is still printed.
 - The default `--max-absent` of 0.5 is a coarse net. A join that lost a third of its rows
   passes it. Use `--class-col` or a lower limit when a smaller loss matters.
 - It reads the exports you give it. Whether those exports match the live tables is up to you.
+- "Nothing is written without `--apply`" covers the checked files. `--self-test` itself creates
+  a temporary directory with synthetic files, then deletes it. The banner says so.
 
 Every line of the module runs in the self-test, so no line is left uncovered. The tool uses no
 network, so there is no network path to stub.
@@ -237,7 +282,9 @@ network, so there is no network path to stub.
 | A lookup key listed twice is refused | Self-test, and a real run on a two-line lookup that exited 1 |
 | Cp1252, UTF-16, `#N/A`, `-9999.0`, `12.0`, `--sentinel -x`, CJK piped, formula cell, `--out` spellings | Real runs, scratch directory, Windows, Python 3.13 |
 | The in-memory join matches pandas | Scratch run, pandas 3.0.5, `how="left"`: 10 rows, 2 left-only, 1 blank, 1 `Not Found` |
-| Python 3.9, 3.12 and 3.13 | Self-test run on each, 126 assertions |
+| A blank key never fans out, and a one-column file keeps its blank keys | Self-test, and real runs on small files (exit 0 and exit 1) |
+| `#N/A`, `-9999.0` and `-999.00` are placeholders | Self-test, and a real run that exited 1 |
+| Python 3.9, 3.12 and 3.13 | Self-test run on each, 150 assertions |
 
 The pandas comparison was a throwaway script. It is not part of this repository.
 
@@ -256,10 +303,12 @@ MIT.
 ## References
 
 - Microsoft, [Joins (SQL Server)](https://learn.microsoft.com/en-us/sql/relational-databases/performance/joins),
-  section "Null values and joins". NULLs do not match each other. A NULL from a failed join is hard to
-  tell from a NULL in the data.
-- Esri, [Add Join](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/add-join.html).
-  `KEEP_ALL` is the default. A record with no match "is given null values". The page says that
+  section "Null values and joins" (page read 2026-10-24). It says that "the null values don't
+  match each other", and that after a left outer join "the results don't make it easy to
+  distinguish a `NULL` in the data from a `NULL` that represents a failure to join".
+- Esri, [Add Join](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/add-join.html)
+  (page read 2026-10-24). `KEEP_ALL` is the default. A record with no match "is given null
+  values for all the fields being appended". The page says that
   "Records from the join table can be matched to more than one record if the join table has an
   Object ID field", and that with no Object ID field "only a one-to-first join is possible".
 - pandas, [`DataFrame.merge`](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.merge.html).
